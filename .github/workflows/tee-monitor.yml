@@ -1,0 +1,80 @@
+name: Tee Time Monitor
+
+on:
+  schedule:
+    - cron: '*/15 11-23,0-3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tee-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Write config.ini from secrets
+        env:
+          CLUBHOUSE_USER: ${{ secrets.CLUBHOUSE_USER }}
+          CLUBHOUSE_PASS: ${{ secrets.CLUBHOUSE_PASS }}
+          PUSHOVER_USER:  ${{ secrets.PUSHOVER_USER }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+        run: |
+          cat > config.ini <<EOF
+          [clubhouse]
+          username = $CLUBHOUSE_USER
+          password = $CLUBHOUSE_PASS
+
+          [notify]
+          method         = pushover
+          pushover_user  = $PUSHOVER_USER
+          pushover_token = $PUSHOVER_TOKEN
+          phone          = 0000000000
+          carrier        = att
+
+          [smtp]
+          host      = unused
+          port      = 587
+          user      = unused
+          password  = unused
+          from_addr = unused@unused
+
+          [filter]
+          window_start_hour = 7
+          window_end_hour   = 9
+          days_ahead        = 21
+          course_id         = 4
+          weekdays_only     = false
+          weekends_only     = true
+          EOF
+
+      - name: Run monitor
+        run: python tee_monitor.py
+
+      - name: Commit updated state.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -f state.json ]; then
+            git add state.json
+            if ! git diff --staged --quiet; then
+              git commit -m "Update state.json [skip ci]"
+              git push || (git pull --rebase && git push)
+            fi
+          fi
