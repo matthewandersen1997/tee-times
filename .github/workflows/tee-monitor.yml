@@ -1,13 +1,17 @@
 name: Tee Time Monitor
 
 on:
-  workflow_dispatch:
+  schedule:
+    # Every 15 min during 6 AM-10 PM Central (covers both CST UTC-6 and CDT UTC-5).
+    # UTC hours 11-23 + 0-3 = 17 hours/day of coverage.
+    - cron: '*/15 11-23,0-3 * * *'
+  workflow_dispatch:  # also expose a "Run workflow" button in the Actions tab
 
 permissions:
-  contents: write
+  contents: write     # so we can commit state.json back after each run
 
 concurrency:
-  group: tee-monitor
+  group: tee-monitor  # don't overlap runs
   cancel-in-progress: false
 
 jobs:
@@ -73,6 +77,7 @@ jobs:
             git add state.json
             if ! git diff --staged --quiet; then
               git commit -m "Update state.json [skip ci]"
+              # Retry push once if remote moved underneath us
               git push || (git pull --rebase && git push)
             fi
           fi
