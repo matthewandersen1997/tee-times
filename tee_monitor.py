@@ -220,6 +220,49 @@ def login(session, cfg):
             "to reach the tee sheet in your browser.")
 
 
+def logout(session):
+    """
+    Explicitly sign out of ClubHouse Online at the end of a run.
+
+    MFTeeTimes enforces a single active booking "tab"/session per account
+    server-side. Because every run used to log in fresh and never sign out,
+    each 15-minute run left the previous run's session dangling; over time
+    the site started rejecting every request with
+    {"error":"BOOKING_TAB_SUPERSEDED"} because it believed another tab
+    already had the tee sheet open under this account. Logging out via the
+    same postback the "Log Out" link on Member_Central uses (class
+    logOutClrSession) releases that server-side session so the next run
+    starts clean. Best-effort only -- never let this fail the whole job.
+    """
+    try:
+        r = session.get(MEMBER_CENTRAL, timeout=30)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        def field(name):
+            el = soup.find("input", {"name": name})
+            return el.get("value", "") if el else ""
+
+        signout = soup.find("a", class_=re.compile(r"logOutClrSession", re.I)) or \
+            soup.find("a", id=re.compile(r"SignOutLink", re.I))
+        href = signout.get("href", "") if signout else ""
+        m = re.search(r"__doPostBack\('([^']+)'", href)
+        if not m:
+            logging.warning("Logout: couldn't find sign-out postback link; skipping.")
+            return
+
+        payload = {
+            "__VIEWSTATE": field("__VIEWSTATE"),
+            "__VIEWSTATEGENERATOR": field("__VIEWSTATEGENERATOR"),
+            "__EVENTVALIDATION": field("__EVENTVALIDATION"),
+            "__EVENTTARGET": m.group(1),
+            "__EVENTARGUMENT": "",
+        }
+        r2 = session.post(MEMBER_CENTRAL, data=payload, timeout=30, allow_redirects=True)
+        logging.info("Logged out (status=%s) to release the account's tee-time session.",
+                     r2.status_code)
+    except requests.RequestException as e:
+        logging.warning("Logout request failed (non-fatal): %s", e)
+
 
 def _find_tee_time_links(html):
     """
@@ -280,23 +323,25 @@ def fetch_teesheet(session, day, course_id):
     r = session.get(TEESHEET_AJAX, params=params, headers=headers,
                     timeout=30, allow_redirects=True)
     if r.status_code != 200:
+        blocked = "BOOKING_TAB_SUPERSEDED" in r.text
         logging.warning("AJAX %s -> %s, body[:200]=%r",
                         day, r.status_code, r.text[:200])
-        return ""
+        return "", blocked
     try:
         j = r.json()
     except ValueError:
         logging.warning("AJAX %s: response not JSON, body[:200]=%r",
                         day, r.text[:200])
-        return ""
+        return "", False
     if not j.get("success"):
+        blocked = j.get("error") == "BOOKING_TAB_SUPERSEDED"
         logging.warning("AJAX %s: success=False, keys=%s, msg=%s",
                         day, list(j.keys()), j.get("msg"))
-        return ""
+        return "", blocked
     html = j.get("data", "") or ""
     if not html:
         logging.warning("AJAX %s: empty data field", day)
-    return html
+    return html, False
 
 
 TIME_PATTERNS = [
@@ -544,54 +589,69 @@ def main():
         logging.error("Login failed: %s", e)
         return 2
 
-    new_openings = []
-    today = date.today()
-    for offset in range(cfg.days_ahead):
-        day = today + timedelta(days=offset)
-        try:
-            html = fetch_teesheet(session, day, cfg.course_id)
-        except requests.RequestException as e:
-            logging.warning("Could not fetch %s: %s", day, e)
-            continue
-
-        if args.debug:
-            save_debug(f"teesheet_{day.isoformat()}.html", html)
-
-        for tt in parse_teesheet(html, day):
-            if not in_window(tt, cfg):
+    try:
+        new_openings = []
+        blocked_days = 0
+        today = date.today()
+        for offset in range(cfg.days_ahead):
+            day = today + timedelta(days=offset)
+            try:
+                html, blocked = fetch_teesheet(session, day, cfg.course_id)
+            except requests.RequestException as e:
+                logging.warning("Could not fetch %s: %s", day, e)
                 continue
-            logging.debug("Found in window: %s [%s]", tt.display(), tt.raw)
-            if tt.key() not in seen:
-                new_openings.append(tt)
-                seen.add(tt.key())
+            if blocked:
+                blocked_days += 1
 
-    if not new_openings:
-        logging.info("No new openings in window %d:00-%d:00.",
-                     cfg.window_start, cfg.window_end)
+            if args.debug:
+                save_debug(f"teesheet_{day.isoformat()}.html", html)
+
+            for tt in parse_teesheet(html, day):
+                if not in_window(tt, cfg):
+                    continue
+                logging.debug("Found in window: %s [%s]", tt.display(), tt.raw)
+                if tt.key() not in seen:
+                    new_openings.append(tt)
+                    seen.add(tt.key())
+
+        if blocked_days and blocked_days == cfg.days_ahead:
+            logging.error(
+                "All %d days were rejected with BOOKING_TAB_SUPERSEDED -- "
+                "the site thinks another tab/session already has the tee "
+                "sheet open under this account. This run's logout (below) "
+                "should clear it for next time; if it recurs, something "
+                "else is browsing the tee sheet under this same login "
+                "concurrently.", cfg.days_ahead)
+
+        if not new_openings:
+            logging.info("No new openings in window %d:00-%d:00.",
+                         cfg.window_start, cfg.window_end)
+            save_state(seen)
+            return 0
+
+        body = "New tee times open:\n" + "\n".join(t.display() for t in new_openings[:8])
+        if len(new_openings) > 8:
+            body += f"\n(+{len(new_openings) - 8} more)"
+        logging.info("Alert body:\n%s", body)
+
+        if args.dry_run:
+            logging.info("Dry run -- not sending SMS.")
+        else:
+            try:
+                if cfg.notify_method == "pushover":
+                    send_pushover(cfg, body)
+                elif cfg.notify_method == "ntfy":
+                    send_ntfy(cfg, body)
+                else:
+                    send_sms(cfg, body)
+            except Exception as e:
+                logging.error("Notification send failed: %s", e)
+                return 3
+
         save_state(seen)
         return 0
-
-    body = "New tee times open:\n" + "\n".join(t.display() for t in new_openings[:8])
-    if len(new_openings) > 8:
-        body += f"\n(+{len(new_openings) - 8} more)"
-    logging.info("Alert body:\n%s", body)
-
-    if args.dry_run:
-        logging.info("Dry run -- not sending SMS.")
-    else:
-        try:
-            if cfg.notify_method == "pushover":
-                send_pushover(cfg, body)
-            elif cfg.notify_method == "ntfy":
-                send_ntfy(cfg, body)
-            else:
-                send_sms(cfg, body)
-        except Exception as e:
-            logging.error("Notification send failed: %s", e)
-            return 3
-
-    save_state(seen)
-    return 0
+    finally:
+        logout(session)
 
 
 if __name__ == "__main__":
