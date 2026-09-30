@@ -58,8 +58,8 @@ jobs:
           from_addr = unused@unused
 
           [filter]
-          window_start_hour = 7
-          window_end_hour   = 9
+          window_start_hour = 9
+          window_end_hour   = 12
           days_ahead        = 21
           course_id         = 4
           weekdays_only     = false
